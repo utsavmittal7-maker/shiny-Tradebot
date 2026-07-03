@@ -44,10 +44,10 @@ const CSS = `
 .main{min-width:0}
 
 /* reconciliation bar */
-.recon{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);border-bottom:1px solid var(--line)}
-.recon .cell{background:var(--panel);padding:16px 22px}
+.recon{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--line);border-bottom:1px solid var(--line)}
+.recon .cell{background:var(--panel);padding:16px 22px;min-width:0}
 .recon .cell .lbl{display:flex;align-items:center;gap:6px;margin-bottom:7px}
-.recon .cell .val{font-size:23px;font-weight:600}
+.recon .cell .val{font-size:23px;font-weight:600;white-space:nowrap}
 .recon .cell .sub{font-size:11px;color:var(--faint);margin-top:3px}
 
 /* topbar */
@@ -66,10 +66,16 @@ const CSS = `
 .card .cardsub{font-size:11.5px;color:var(--faint);margin-bottom:14px}
 
 /* kpi strip */
-.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
-.kpi{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
-.kpi .k{font-size:24px;font-weight:600;margin-top:6px}
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;min-width:0}
+.kpi .k{font-size:24px;font-weight:600;margin-top:6px;white-space:nowrap}
 .kpi .d{font-size:11px;color:var(--faint);margin-top:4px}
+
+/* responsive multi-column grids (classes so media queries can override — inline styles cannot) */
+.cols2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+.cols3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}
+.col-hero{grid-template-columns:1.1fr minmax(0,1fr)}
+.col-tax{grid-template-columns:minmax(0,1fr) 1.6fr}
 
 /* table */
 .tbl{width:100%;border-collapse:collapse;font-size:12.5px}
@@ -77,6 +83,8 @@ const CSS = `
 .tbl td{padding:10px 12px;border-bottom:1px solid var(--line-soft);white-space:nowrap}
 .tbl tr:hover td{background:var(--panel-2)}
 .tbl .r{text-align:right}
+/* let wide tables scroll instead of overflowing the page on narrow screens */
+.card:has(> table.tbl){overflow-x:auto}
 .pill{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:20px;font-size:10.5px;font-weight:600;background:var(--panel-2);border:1px solid var(--line);text-transform:capitalize}
 .pill.buy{color:var(--up)} .pill.sell,.pill.spend{color:var(--down)} .pill.swap{color:var(--brand)}
 .pill.income,.pill.staking,.pill.airdrop,.pill.mining,.pill.interest{color:var(--warn)}
@@ -126,7 +134,21 @@ const CSS = `
 .rategrid{display:grid;grid-template-columns:1fr 110px;gap:10px 14px;align-items:center}
 .rategrid .rl{font-size:12.5px;color:var(--muted)}
 .disc{font-size:11px;color:var(--faint);line-height:1.5;margin-top:14px;padding-top:12px;border-top:1px solid var(--line-soft)}
-@media(max-width:820px){.shell{grid-template-columns:1fr}.rail{position:static;height:auto;flex-direction:row;overflow-x:auto}.railfoot{display:none}.recon,.kpis{grid-template-columns:repeat(2,1fr)}}
+/* laptops / small windows: drop dense 4- and 3-col rows to 2 cols and stack the split layouts */
+@media(max-width:1150px){
+  .recon,.kpis,.cols3{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .col-hero,.col-tax{grid-template-columns:minmax(0,1fr)}
+}
+/* tablet: sidebar moves to a horizontal top rail */
+@media(max-width:820px){
+  .shell{grid-template-columns:1fr}
+  .rail{position:static;height:auto;flex-direction:row;overflow-x:auto}
+  .railfoot{display:none}
+}
+/* phones: everything single column */
+@media(max-width:680px){
+  .recon,.kpis,.cols2,.cols3{grid-template-columns:minmax(0,1fr)}
+}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -742,7 +764,7 @@ function Overview({ portfolio, engine, cur, tax, country, setView }) {
         <div className="kpi"><span className="eyebrow">Realized P/L · all time</span><div className="k"><Signed v={portfolio.totalRealized} cur={cur} /></div><div className="d">across all years</div></div>
       </div>
 
-      <div className="grid" style={{ gridTemplateColumns: "1.1fr 1fr", gap: 16 }}>
+      <div className="grid col-hero" style={{ gap: 16 }}>
         <div className="card">
           <h3>Where your money sits</h3>
           <div className="cardsub">Current value spread across coins</div>
@@ -848,7 +870,7 @@ function Holdings({ portfolio, cur, prices, setPrices }) {
         </table>
       </div>
 
-      <div className="grid" style={{ gridTemplateColumns: "repeat(3,1fr)", gap: 16 }}>
+      <div className="grid cols3" style={{ gap: 16 }}>
         {breakdowns.map((b) => {
           const rows = Object.entries(b.data).map(([k, m]) => ({ k, v: valueOf(m), assets: Object.keys(m).filter((a) => m[a] > 1e-8).length }))
             .filter((r) => r.v > 0.5).sort((a, z) => z.v - a.v);
@@ -964,7 +986,7 @@ function AddTxModal({ onClose, onAdd }) {
     <div className="modal-bg" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}><h3 style={{ margin: 0 }}>Add transaction</h3><button className="btn ghost sm" onClick={onClose}><X size={16} /></button></div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 16 }}>
+        <div className="cols2" style={{ gap: 12, marginTop: 16 }}>
           <div className="field"><label>Date</label><input className="inp" type="date" value={f.date} onChange={(e) => up("date", e.target.value)} /></div>
           <div className="field"><label>Type</label>
             <div className="sel"><select className="inp" value={f.type} onChange={(e) => up("type", e.target.value)}>{TX_TYPES.map((t) => <option key={t} value={t}>{t.replace("_", " ")}</option>)}</select></div></div>
@@ -1008,7 +1030,7 @@ function TaxReport({ tax, C, country, activeYear, ratesOverride, setRatesOverrid
         <div><b>{C.name} · {C.method === "pool" ? "Section 104 pooling" : C.method.toUpperCase()} basis.</b> {C.note}</div>
       </div>
 
-      <div className="kpis" style={{ gridTemplateColumns: "repeat(4,1fr)" }}>
+      <div className="kpis">
         <div className="kpi"><span className="eyebrow">Proceeds</span><div className="k num">{fmt(tax.proceeds, cur)}</div><div className="d">{tax.disps.length} disposals</div></div>
         <div className="kpi"><span className="eyebrow">Cost basis</span><div className="k num">{fmt(tax.costBasis, cur)}</div><div className="d">matched acquisitions</div></div>
         <div className="kpi"><span className="eyebrow">Net capital gain</span><div className="k"><Signed v={tax.netGain} cur={cur} /></div><div className="d">before allowances</div></div>
@@ -1052,7 +1074,7 @@ function TaxReport({ tax, C, country, activeYear, ratesOverride, setRatesOverrid
         </div>
       )}
 
-      <div className="grid" style={{ gridTemplateColumns: "1fr 1.6fr", gap: 16 }}>
+      <div className="grid col-tax" style={{ gap: 16 }}>
         {/* rate assumptions */}
         <div className="card">
           <h3>Rate assumptions</h3><div className="cardsub">Edit to match your bracket — tax updates live</div>
@@ -1222,7 +1244,7 @@ function ImportView({ setTxs, txs, country, setView }) {
 
   return (
     <div className="grid" style={{ gap: 16, maxWidth: 900 }}>
-      <div className="card" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+      <div className="card cols2" style={{ gap: 14 }}>
         <div className="field">
           <label>Label this batch (optional)</label>
           <input className="inp" placeholder="e.g. Kraken 2024 export" value={label} onChange={(e) => setLabel(e.target.value)} />
@@ -1323,7 +1345,7 @@ function Connections({ setTxs, txs, setView }) {
         <div><b>Simulated in this preview.</b> Live exchange sync must run server-side — API secrets can't be safely held in a browser and exchanges block browser-origin calls (CORS). Below is the real connection flow; pressing <b>Connect</b> runs a demo sync that loads sample transactions so you can see how it lands in your ledger. Production wiring is outlined at the bottom.</div>
       </div>
 
-      <div className="grid" style={{ gridTemplateColumns: "repeat(3,1fr)", gap: 14 }}>
+      <div className="grid cols3" style={{ gap: 14 }}>
         {PLATFORMS.map((p) => {
           const st = status[p.id];
           const isConn = connected.has(`${p.name} (synced)`) || st === "done";
