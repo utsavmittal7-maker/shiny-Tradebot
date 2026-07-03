@@ -33,6 +33,8 @@ jobs:
           cache-dependency-path: crypto-tax-calculator/package-lock.json
       - run: npm ci
       - run: npm run build
+        env:
+          VITE_BASE: /shiny-Tradebot/
       - uses: actions/configure-pages@v5
         with:
           enablement: true
