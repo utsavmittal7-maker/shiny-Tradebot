@@ -494,6 +494,84 @@ function normalizeRow(raw) {
     source: "File import",
   };
 }
+/* ---- PDF ingestion (best-effort, browser-side via PDF.js, lazy-loaded) ---- */
+const HEADER_WORDS = /^(date|time|timestamp|datetime|type|action|kind|operation|asset|coin|symbol|currency|token|base|amount|quantity|qty|size|units|price|rate|fee|fees|commission|value|total|proceeds|subtotal|wallet|account|platform|exchange|network|chain)$/i;
+
+// Reconstruct text lines from a PDF, grouping items by their y-position and
+// keeping each item's x so we can rebuild columns. Returns array of lines,
+// each an array of { x, s } text fragments left-to-right.
+async function pdfToLines(data) {
+  const pdfjs = await import("pdfjs-dist");
+  pdfjs.GlobalWorkerOptions.workerSrc = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
+  const pdf = await pdfjs.getDocument({ data }).promise;
+  const lines = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const content = await (await pdf.getPage(p)).getTextContent();
+    const rows = new Map();
+    for (const it of content.items) {
+      if (!it.str || !it.str.trim()) continue;
+      const y = Math.round(it.transform[5]);
+      let key = null;
+      for (const k of rows.keys()) if (Math.abs(k - y) <= 2) { key = k; break; }
+      if (key == null) { key = y; rows.set(key, []); }
+      rows.get(key).push({ x: it.transform[4], s: it.str.trim() });
+    }
+    // PDF y grows upward, so sort descending for top-to-bottom reading order
+    for (const [, items] of [...rows.entries()].sort((a, b) => b[0] - a[0])) {
+      lines.push(items.sort((a, b) => a.x - b.x));
+    }
+  }
+  return lines;
+}
+
+async function parsePdf(data) {
+  const lines = await pdfToLines(data);
+
+  // Strategy A: find a header row, then slot each data cell into the nearest
+  // header column by x-position and feed the resulting objects to normalizeRow.
+  let headerIdx = -1, headerItems = null, bestHits = 2;
+  lines.forEach((items, i) => {
+    const hits = items.filter((it) => HEADER_WORDS.test(it.s)).length;
+    if (hits > bestHits) { bestHits = hits; headerIdx = i; headerItems = items; }
+  });
+  if (headerIdx >= 0) {
+    const cols = headerItems.map((it) => ({ x: it.x, name: it.s }));
+    const objs = [];
+    for (let i = headerIdx + 1; i < lines.length; i++) {
+      const items = lines[i];
+      if (items.length < 2) continue;
+      const obj = {};
+      for (const it of items) {
+        let nearest = cols[0], dist = Infinity;
+        for (const c of cols) { const d = Math.abs(c.x - it.x); if (d < dist) { dist = d; nearest = c; } }
+        obj[nearest.name] = obj[nearest.name] ? `${obj[nearest.name]} ${it.s}` : it.s;
+      }
+      objs.push(obj);
+    }
+    const rows = objs.map(normalizeRow).filter((r) => r.amount > 0 || r.type.includes("transfer"));
+    if (rows.length) return rows;
+  }
+
+  // Strategy B: per-line regex fallback for non-tabular statements.
+  const typeWords = Object.keys(TYPE_ALIAS).sort((a, b) => b.length - a.length);
+  const rows = [];
+  for (const items of lines) {
+    const line = items.map((it) => it.s).join(" ").replace(/\s+/g, " ").trim();
+    const dateM = line.match(/\b(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b/);
+    if (!dateM) continue;
+    const type = typeWords.find((w) => line.toLowerCase().includes(w));
+    if (!type) continue;
+    const rest = line.replace(dateM[0], " ");
+    const assetM = rest.match(/\b([A-Z]{2,6})\b/);
+    if (!assetM) continue;
+    const nums = (rest.match(/-?\d[\d,]*\.?\d+/g) || []).map((n) => Number(n.replace(/,/g, ""))).filter((n) => !isNaN(n));
+    rows.push(normalizeRow({ date: dateM[1], type, asset: assetM[1], amount: nums[0], price: nums[1] }));
+  }
+  const kept = rows.filter((r) => r.amount > 0 || r.type.includes("transfer"));
+  if (!kept.length) throw new Error("Couldn't find transaction rows in this PDF. Exchange PDFs vary a lot in layout — if this one didn't parse, export CSV or Excel from your exchange instead.");
+  return kept;
+}
+
 function parseFile(file) {
   return new Promise((resolve, reject) => {
     const ext = file.name.split(".").pop().toLowerCase();
@@ -521,8 +599,9 @@ function parseFile(file) {
       };
       reader.readAsText(file);
     } else if (ext === "pdf") {
-      reject(new Error("PDF statements vary too much between exchanges to parse reliably in the browser. Export a CSV or Excel file from your exchange instead, or use the CSV template below."));
-    } else reject(new Error("Unsupported file type. Use CSV, Excel (.xlsx), or JSON."));
+      reader.onload = (e) => parsePdf(new Uint8Array(e.target.result)).then(resolve).catch(reject);
+      reader.readAsArrayBuffer(file);
+    } else reject(new Error("Unsupported file type. Use CSV, Excel (.xlsx), JSON, or PDF."));
   });
 }
 
@@ -1265,7 +1344,7 @@ function ImportView({ setTxs, txs, country, setView }) {
         onClick={() => inputRef.current?.click()} style={{ cursor: "pointer" }}>
         <Upload className="ic" />
         <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Drop this year's statements here</div>
-        <div style={{ color: "var(--muted)", fontSize: 13 }}>CSV, Excel (.xlsx) or JSON from any exchange or wallet. Columns are auto-detected and mapped.</div>
+        <div style={{ color: "var(--muted)", fontSize: 13 }}>CSV, Excel (.xlsx), JSON or PDF from any exchange or wallet. Columns are auto-detected and mapped.</div>
         <input ref={inputRef} type="file" multiple accept=".csv,.tsv,.txt,.xlsx,.xls,.json,.pdf" style={{ display: "none" }}
           onChange={(e) => handle([...e.target.files])} />
       </div>
@@ -1294,7 +1373,7 @@ function ImportView({ setTxs, txs, country, setView }) {
 
       <div className="banner warn" style={{ alignItems: "flex-start" }}>
         <FileText size={16} style={{ flexShrink: 0, marginTop: 1 }} />
-        <div><b>PDF statements:</b> exchange PDFs are inconsistent and can't be parsed reliably in-browser. Export CSV or Excel from your exchange (every major one offers this), or use the template. In production, a server-side per-exchange parser handles PDFs.</div>
+        <div><b>PDF statements:</b> parsed on a best-effort basis right in your browser — it reads the text, finds the transaction table, and maps the columns. Because exchange PDF layouts vary a lot, results can be imperfect; always sanity-check the imported rows. If a PDF doesn't parse cleanly, export CSV or Excel from your exchange (every major one offers this) for the most reliable import.</div>
       </div>
     </div>
   );
