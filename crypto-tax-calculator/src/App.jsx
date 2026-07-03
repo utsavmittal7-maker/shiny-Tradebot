@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef, useCallback } from "react";
+import React, { useState, useMemo, useRef, useCallback, useEffect } from "react";
 import {
   PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine,
 } from "recharts";
@@ -541,14 +541,53 @@ const Signed = ({ v, cur, big }) => (
   </span>
 );
 
+/* ---------- Empty state (shown before any data is added) ---------- */
+function EmptyState({ setView, loadSample }) {
+  return (
+    <div className="card" style={{ textAlign: "center", padding: "52px 24px", maxWidth: 560, margin: "48px auto" }}>
+      <div className="dot" style={{ margin: "0 auto 18px", width: 44, height: 44, borderRadius: 12 }}>
+        <Wallet size={20} />
+      </div>
+      <h2 style={{ margin: "0 0 10px", fontSize: 20 }}>No transactions yet</h2>
+      <div style={{ color: "var(--muted)", fontSize: 14, lineHeight: 1.65, marginBottom: 26 }}>
+        Import your exchange or wallet statements to see your holdings, realized/unrealized
+        gains, and estimated tax. Everything stays in your browser — nothing is uploaded.
+      </div>
+      <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+        <button className="btn" onClick={() => setView("import")}><Upload size={15} /> Import your data</button>
+        <button className="btn ghost" onClick={() => setView("connect")}><LinkIcon size={15} /> Connect an account</button>
+        <button className="btn ghost" onClick={loadSample}>Load sample data</button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== PERSISTENCE ============================== */
+const LS_KEY = "ledgerline.v1";
+function loadSaved() {
+  try {
+    const raw = typeof localStorage !== "undefined" && localStorage.getItem(LS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
 /* ============================== MAIN APP ============================== */
 export default function App() {
-  const [txs, setTxs] = useState(SAMPLE);
-  const [prices, setPrices] = useState(CURRENT_PRICES);
-  const [country, setCountry] = useState("IE");
+  const saved = useMemo(loadSaved, []);
+  // Start empty by default — your data stays in the browser once you add it.
+  const [txs, setTxs] = useState(() => saved?.txs ?? []);
+  const [prices, setPrices] = useState(() => saved?.prices ?? CURRENT_PRICES);
+  const [country, setCountry] = useState(() => saved?.country ?? "IE");
   const [view, setView] = useState("overview");
-  const [ratesOverride, setRatesOverride] = useState({});
-  const [salary, setSalary] = useState(50000); // other annual income, for Ireland marginal rate
+  const [ratesOverride, setRatesOverride] = useState(() => saved?.ratesOverride ?? {});
+  const [salary, setSalary] = useState(() => saved?.salary ?? 50000); // other annual income, for Ireland marginal rate
+
+  // Persist everything locally so it survives refreshes. Nothing leaves the browser.
+  useEffect(() => {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify({ txs, prices, country, salary, ratesOverride }));
+    } catch { /* storage full or unavailable — ignore */ }
+  }, [txs, prices, country, salary, ratesOverride]);
 
   // merge editable rates into a working country map
   const C = useMemo(() => {
@@ -579,6 +618,10 @@ export default function App() {
     { id: "connect", label: "Connect accounts", icon: LinkIcon },
     { id: "import", label: "Import & sources", icon: Upload },
   ];
+
+  // With no data yet, the data-driven views would just show zeros — show a
+  // guided empty state instead. Import/Connect still render so data can be added.
+  const showEmpty = txs.length === 0 && ["overview", "holdings", "transactions", "tax"].includes(view);
 
   return (
     <div className="ctx-root">
@@ -620,18 +663,26 @@ export default function App() {
             </div>
           </div>
 
-          {/* RECONCILIATION BAR — the signature strip, always visible */}
-          <ReconBar tax={tax} portfolio={portfolio} cur={C.cur} method={C.method} />
+          {showEmpty ? (
+            <div className="wrap">
+              <EmptyState setView={setView} loadSample={() => setTxs(SAMPLE)} />
+            </div>
+          ) : (
+            <>
+              {/* RECONCILIATION BAR — the signature strip */}
+              <ReconBar tax={tax} portfolio={portfolio} cur={C.cur} method={C.method} />
 
-          <div className="wrap">
-            {view === "overview" && <Overview portfolio={portfolio} engine={engine} cur={C.cur} tax={tax} country={country} setView={setView} />}
-            {view === "holdings" && <Holdings portfolio={portfolio} cur={C.cur} prices={prices} setPrices={setPrices} />}
-            {view === "transactions" && <Transactions txs={txs} setTxs={setTxs} engine={engine} cur={C.cur} />}
-            {view === "tax" && <TaxReport tax={tax} C={C} country={country} activeYear={activeYear}
-              ratesOverride={ratesOverride} setRatesOverride={setRatesOverride} salary={salary} setSalary={setSalary} />}
-            {view === "connect" && <Connections setTxs={setTxs} txs={txs} setView={setView} />}
-            {view === "import" && <ImportView setTxs={setTxs} txs={txs} country={country} setView={setView} />}
-          </div>
+              <div className="wrap">
+                {view === "overview" && <Overview portfolio={portfolio} engine={engine} cur={C.cur} tax={tax} country={country} setView={setView} />}
+                {view === "holdings" && <Holdings portfolio={portfolio} cur={C.cur} prices={prices} setPrices={setPrices} />}
+                {view === "transactions" && <Transactions txs={txs} setTxs={setTxs} engine={engine} cur={C.cur} />}
+                {view === "tax" && <TaxReport tax={tax} C={C} country={country} activeYear={activeYear}
+                  ratesOverride={ratesOverride} setRatesOverride={setRatesOverride} salary={salary} setSalary={setSalary} />}
+                {view === "connect" && <Connections setTxs={setTxs} txs={txs} setView={setView} />}
+                {view === "import" && <ImportView setTxs={setTxs} txs={txs} country={country} setView={setView} />}
+              </div>
+            </>
+          )}
         </main>
       </div>
     </div>
@@ -1214,7 +1265,7 @@ function ImportView({ setTxs, txs, country, setView }) {
         <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
           <button className="btn" onClick={template}><Download size={15} /> Download CSV template</button>
           <button className="btn ghost" onClick={() => setView("connect")}><LinkIcon size={15} /> Connect an exchange instead</button>
-          <button className="btn ghost" onClick={() => setTxs(SAMPLE)}>Reset to sample</button>
+          <button className="btn ghost" onClick={() => setTxs(SAMPLE)}>Load sample data</button>
           <button className="btn ghost" onClick={() => setTxs([])}>Clear all ({txs.length})</button>
         </div>
       </div>
