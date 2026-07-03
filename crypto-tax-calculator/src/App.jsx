@@ -1402,6 +1402,204 @@ function genDemo(name) {
     connType: "api", ...b,
   }));
 }
+/* ============================== ON-CHAIN WALLET SYNC ============================== */
+// One Etherscan V2 endpoint serves many EVM chains via the chainid param.
+const EVM_CHAINS = [
+  { id: 1, name: "Ethereum", native: "ETH" },
+  { id: 8453, name: "Base", native: "ETH" },
+  { id: 42161, name: "Arbitrum", native: "ETH" },
+  { id: 10, name: "Optimism", native: "ETH" },
+  { id: 137, name: "Polygon", native: "POL" },
+  { id: 56, name: "BNB Chain", native: "BNB" },
+];
+const STABLES = new Set(["USDC", "USDT", "DAI", "BUSD", "TUSD", "USDP", "GUSD"]);
+const ETHERSCAN_KEY_LS = "ledgerline.etherscanKey";
+
+function detectAddressKind(addr) {
+  const a = (addr || "").trim();
+  if (/^0x[0-9a-fA-F]{40}$/.test(a)) return "evm";
+  if (/^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}$/.test(a)) return "btc";
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(a)) return "sol";
+  return null;
+}
+
+async function etherscanCall(chainId, apiKey, params) {
+  const qs = new URLSearchParams({ chainid: String(chainId), apikey: apiKey || "", ...params });
+  const res = await fetch(`https://api.etherscan.io/v2/api?${qs}`);
+  if (!res.ok) throw new Error(`Explorer returned HTTP ${res.status}`);
+  const j = await res.json();
+  if (j.status === "0") {
+    const msg = String(j.result || j.message || "");
+    if (/no transactions found/i.test(msg) || /no transactions found/i.test(j.message || "")) return [];
+    if (/api key|rate limit|max .*rate|invalid/i.test(msg)) throw new Error(msg);
+    return [];
+  }
+  return Array.isArray(j.result) ? j.result : [];
+}
+
+// Pull native + ERC-20 transfers for an address and shape them into ledger rows
+// (still unpriced). Incoming = acquisition, outgoing = disposal.
+async function fetchEvmTransfers(address, chain, apiKey) {
+  const addr = address.toLowerCase();
+  const [normal, tokens] = await Promise.all([
+    etherscanCall(chain.id, apiKey, { module: "account", action: "txlist", address, startblock: "0", endblock: "99999999", sort: "asc" }),
+    etherscanCall(chain.id, apiKey, { module: "account", action: "tokentx", address, startblock: "0", endblock: "99999999", sort: "asc" }),
+  ]);
+  const short = `${address.slice(0, 6)}…${address.slice(-4)}`;
+  const rows = [];
+  for (const t of normal) {
+    const val = Number(t.value) / 1e18;
+    if (!val) continue; // skip pure contract calls with no native movement
+    const incoming = t.to?.toLowerCase() === addr;
+    rows.push({
+      date: new Date(Number(t.timeStamp) * 1000).toISOString().slice(0, 10),
+      type: incoming ? "buy" : "sell", asset: chain.native, amount: val,
+      fee: incoming ? 0 : (Number(t.gasUsed) * Number(t.gasPrice)) / 1e18,
+      wallet: short, platform: `${chain.name} · ${short}`, network: chain.name,
+      hash: t.hash, connType: "onchain", selfMaybe: t.from?.toLowerCase() === addr && incoming,
+    });
+  }
+  for (const t of tokens) {
+    const dec = Number(t.tokenDecimal) || 18;
+    const amt = Number(t.value) / 10 ** dec;
+    if (!amt) continue;
+    const incoming = t.to?.toLowerCase() === addr;
+    rows.push({
+      date: new Date(Number(t.timeStamp) * 1000).toISOString().slice(0, 10),
+      type: incoming ? "buy" : "sell", asset: (t.tokenSymbol || "?").toUpperCase(), amount: amt, fee: 0,
+      wallet: short, platform: `${chain.name} · ${short}`, network: chain.name,
+      hash: t.hash, connType: "onchain",
+    });
+  }
+  return rows;
+}
+
+// Keyless historical daily close prices (USD) from Coinbase's public candles API.
+// Returns a { "YYYY-MM-DD": price } map for one symbol, or null if unsupported.
+async function fetchDailyCloses(symbol, minDate, maxDate) {
+  if (STABLES.has(symbol)) return "stable";
+  const start = Math.floor(new Date(minDate + "T00:00:00Z").getTime() / 1000);
+  const end = Math.floor(new Date(maxDate + "T00:00:00Z").getTime() / 1000) + 86400;
+  const map = {};
+  let s = start, any = false;
+  while (s < end) {
+    const e = Math.min(s + 300 * 86400, end);
+    const url = `https://api.exchange.coinbase.com/products/${symbol}-USD/candles?granularity=86400&start=${new Date(s * 1000).toISOString()}&end=${new Date(e * 1000).toISOString()}`;
+    let res;
+    try { res = await fetch(url); } catch { return any ? map : null; }
+    if (res.status === 404) return null; // no such trading pair
+    if (!res.ok) break;
+    const candles = await res.json();
+    if (Array.isArray(candles)) for (const c of candles) { map[new Date(c[0] * 1000).toISOString().slice(0, 10)] = c[4]; any = true; }
+    s = e + 86400;
+  }
+  return any ? map : null;
+}
+
+// Assign a fair-value price to each row using the nearest available daily close.
+async function priceOnchainRows(rows) {
+  if (!rows.length) return rows;
+  const dates = rows.map((r) => r.date).sort();
+  const [minDate, maxDate] = [dates[0], dates[dates.length - 1]];
+  const symbols = [...new Set(rows.map((r) => r.asset))];
+  const priceMaps = {};
+  for (const sym of symbols) {
+    try { priceMaps[sym] = await fetchDailyCloses(sym, minDate, maxDate); }
+    catch { priceMaps[sym] = null; }
+  }
+  const nearest = (map, date) => {
+    if (map[date] != null) return map[date];
+    const keys = Object.keys(map).sort();
+    if (!keys.length) return null;
+    let best = keys[0];
+    for (const k of keys) if (Math.abs(new Date(k) - new Date(date)) < Math.abs(new Date(best) - new Date(date))) best = k;
+    return map[best];
+  };
+  return rows.map((r) => {
+    const m = priceMaps[r.asset];
+    let price = 0, noPrice = true;
+    if (m === "stable") { price = 1; noPrice = false; }
+    else if (m) { const p = nearest(m, r.date); if (p != null) { price = p; noPrice = false; } }
+    return { ...r, id: uid(), price, source: `${r.platform} (on-chain)`, noPrice };
+  });
+}
+
+function WalletSync({ setTxs }) {
+  const [address, setAddress] = useState("");
+  const [chainId, setChainId] = useState(1);
+  const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem(ETHERSCAN_KEY_LS) || ""; } catch { return ""; } });
+  const [phase, setPhase] = useState("idle"); // idle | syncing | done | error
+  const [note, setNote] = useState("");
+  const [err, setErr] = useState("");
+
+  useEffect(() => { try { localStorage.setItem(ETHERSCAN_KEY_LS, apiKey); } catch { /* ignore */ } }, [apiKey]);
+
+  const kind = address.trim() ? detectAddressKind(address) : null;
+  const chain = EVM_CHAINS.find((c) => c.id === chainId);
+
+  const run = async () => {
+    setErr(""); setNote("");
+    const a = address.trim();
+    const k = detectAddressKind(a);
+    if (!k) { setErr("That doesn't look like a valid wallet address."); return; }
+    if (k !== "evm") { setErr(`${k === "btc" ? "Bitcoin" : "Solana"} addresses aren't supported yet — EVM (0x…) addresses only for now.`); return; }
+    if (!apiKey.trim()) { setErr("Add a free Etherscan API key to pull on-chain data (link below)."); return; }
+    setPhase("syncing");
+    try {
+      setNote("Fetching transfers from the explorer…");
+      const raw = await fetchEvmTransfers(a, chain, apiKey.trim());
+      if (!raw.length) { setPhase("done"); setNote(`No transfers found for this address on ${chain.name}.`); return; }
+      setNote(`Pricing ${raw.length} transfers with historical daily closes…`);
+      const priced = await priceOnchainRows(raw);
+      const src = `${chain.name} · ${a.slice(0, 6)}…${a.slice(-4)} (on-chain)`;
+      setTxs((prev) => [...prev.filter((t) => t.source !== src), ...priced]);
+      const unpriced = priced.filter((r) => r.noPrice).length;
+      setPhase("done");
+      setNote(`Synced ${priced.length} transfers from ${chain.name}.${unpriced ? ` ${unpriced} had no market price — open Transactions to set a value.` : " Realized & unrealized PnL are updated on the dashboard."}`);
+    } catch (e) {
+      setPhase("error"); setErr(e.message || "Sync failed. Check the address, chain and API key.");
+    }
+  };
+
+  const busy = phase === "syncing";
+  return (
+    <div className="card">
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+        <div style={{ width: 30, height: 30, borderRadius: 8, background: "linear-gradient(135deg,var(--brand),var(--brand-dim))", display: "flex", alignItems: "center", justifyContent: "center", color: "#06201E" }}><Globe size={16} /></div>
+        <div><h3 style={{ margin: 0 }}>Sync an on-chain wallet <span className="brand" style={{ fontSize: 11 }}>· live</span></h3><div className="cardsub" style={{ margin: 0 }}>Paste a public address — it pulls the full transfer history and computes PnL. Read-only; the address is public.</div></div>
+      </div>
+
+      <div className="grid cols2" style={{ gap: 12, marginTop: 14 }}>
+        <div className="field" style={{ gridColumn: "1 / -1" }}>
+          <label>Public wallet address {kind && <span className="tag" style={{ marginLeft: 6 }}>{kind === "evm" ? "EVM detected" : kind === "btc" ? "Bitcoin" : "Solana"}</span>}</label>
+          <input className="inp num" placeholder="0x… (Ethereum / Base / Arbitrum / Optimism / Polygon / BNB)" value={address} onChange={(e) => setAddress(e.target.value)} />
+        </div>
+        <div className="field">
+          <label>Network</label>
+          <div className="sel"><select className="inp" value={chainId} onChange={(e) => setChainId(Number(e.target.value))}>{EVM_CHAINS.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select><ChevronDown size={14} className="chev" /></div>
+        </div>
+        <div className="field">
+          <label>Etherscan API key (free)</label>
+          <input className="inp num" type="password" placeholder="paste key" value={apiKey} onChange={(e) => setApiKey(e.target.value)} />
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginTop: 14, alignItems: "center", flexWrap: "wrap" }}>
+        <button className="btn primary" onClick={run} disabled={busy}>{busy ? <><RefreshCw size={15} className="spin" /> Syncing…</> : <><RefreshCw size={15} /> Sync wallet</>}</button>
+        <a className="btn ghost" href="https://etherscan.io/apis" target="_blank" rel="noreferrer"><KeyRound size={14} /> Get a free API key</a>
+      </div>
+
+      {note && <div className="banner info" style={{ marginTop: 12 }}><CheckCircle2 size={15} style={{ flexShrink: 0 }} />{note}</div>}
+      {err && <div className="banner warn" style={{ marginTop: 12 }}><AlertTriangle size={15} style={{ flexShrink: 0 }} />{err}</div>}
+
+      <div className="banner warn" style={{ marginTop: 12, alignItems: "flex-start" }}>
+        <Info size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+        <div><b>How to read the result.</b> Incoming transfers are treated as acquisitions and outgoing as disposals, each valued at that day's market price (historical daily close, in USD). That's a solid approximation, but on-chain data can't tell a genuine trade from a move between your <i>own</i> wallets — review the imported rows in <b>Transactions</b> and mark any self-transfers as non-taxable. Tokens with no USD market are imported with a blank price for you to fill. EVM chains only for now; Bitcoin & Solana are separate integrations.</div>
+      </div>
+    </div>
+  );
+}
+
 function Connections({ setTxs, txs, setView }) {
   const [active, setActive] = useState(null); // platform being connected
   const [status, setStatus] = useState({});   // id -> 'syncing' | 'done'
@@ -1419,9 +1617,11 @@ function Connections({ setTxs, txs, setView }) {
 
   return (
     <div className="grid" style={{ gap: 16, maxWidth: 900 }}>
+      <WalletSync setTxs={setTxs} />
+
       <div className="banner info" style={{ alignItems: "flex-start" }}>
         <ShieldCheck size={17} style={{ flexShrink: 0, marginTop: 1 }} />
-        <div><b>Simulated in this preview.</b> Live exchange sync must run server-side — API secrets can't be safely held in a browser and exchanges block browser-origin calls (CORS). Below is the real connection flow; pressing <b>Connect</b> runs a demo sync that loads sample transactions so you can see how it lands in your ledger. Production wiring is outlined at the bottom.</div>
+        <div><b>On-chain wallet sync above is live</b> — it reads a public address directly from the browser. The <b>exchange</b> tiles below are still simulated: exchange API secrets can't be safely held in a browser and exchanges block browser-origin calls (CORS), so pressing <b>Connect</b> loads demo transactions. A production build moves those to a server (outlined at the bottom).</div>
       </div>
 
       <div className="grid cols3" style={{ gap: 14 }}>
